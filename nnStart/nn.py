@@ -56,7 +56,7 @@ if not os.path.exists(csv_filename):
         'ay_x100': np.random.uniform(-200, 200, 100),
         'az_x100': np.random.uniform(-1000, -980, 100), # Gravity mostly
         'amag_x100': np.random.uniform(980, 1020, 100),
-        'target_strategy': np.random.uniform(0, 1, 100) # What we want to predict
+      #  'target_strategy': np.random.uniform(0, 1, 100) # What we want to predict
     }
     pd.DataFrame(mock_data).to_csv(csv_filename, index=False)
 
@@ -86,13 +86,26 @@ df['delta_time_s'] = df['timestamp_ms'].diff() / 1000.0
         # The very first row will have a NaN delta-time (since there is no previous row). Fill it with 0.
 df['delta_time_s'] = df['delta_time_s'].fillna(0)
     # b.iv Energy consumption (Joules): Power (Watts) * Delta-Time (seconds)
-df['energy_consumed_joules'] = df['power_watts'] * df['delta_time_s']
+# Energy consumed between the previous row and the current row.
+average_power_watts = (
+    df['power_watts']
+    + df['power_watts'].shift(1)
+) / 2.0
 
-# c. Generate dummy answers if missing
-if 'target_strategy' not in df.columns:
-    print("\n[WARNING]: 'target_strategy' column not found in CSV.")
-    print("Generating a dummy target column so training can proceed...\n")
-    df['target_strategy'] = np.random.uniform(0, 1, len(df))
+df['energy_consumed_joules'] = (
+    average_power_watts
+    * df['delta_time_s']
+).fillna(0.0)
+
+# The target for row i is the measured energy in the next interval.
+df['target_next_energy_joules'] = (
+    df['energy_consumed_joules'].shift(-1)
+)
+
+# The final row has no future interval, so it cannot be used for training.
+df = df.dropna(
+    subset=['target_next_energy_joules']
+).reset_index(drop=True)
 
 # d. define exact input features
 feature_columns = [
@@ -103,7 +116,7 @@ feature_columns = [
 # Extract the raw inputs (X) and the target we want to predict (y)
 # TODO: ensure actual CSV has a column for the target strategy
 X_raw = df[feature_columns].values
-y_raw = df['target_strategy'].values
+y_raw = df['target_next_energy_joules'].values
 
 # CRITICAL STEP: Scale the features so they all have a mean of 0 and variance of 1
 scaler = StandardScaler()
@@ -117,8 +130,8 @@ y_train = torch.tensor(y_raw, dtype=torch.float32).view(-1, 1) # Reshape to a co
 # 4. SETUP HYPERPARAMETERS
 # ==========================================
 # assume static feature vector has 8 variables: 'elapsed_time_s', 'current_mA', 'voltage_mV', 'power_watts', 'energy_consumed_joules', 'ax_x100', 'ay_x100', 'az_x100', 'amag_x100' --> = revised columns of data from telemetry_dumps + power + energy consumed
-INPUT_FEATURES = 9
-# Let's assume 'strategy' is a single continuous value (e.g., Target Throttle %)
+INPUT_FEATURES = len(feature_columns) # calculates length based on the # of input names
+# The output is predicted next-interval energy in joules.
 OUTPUT_FEATURES = 1 
 HIDDEN_NEURONS = 32
 LEARNING_RATE = 0.005
@@ -171,7 +184,13 @@ new_telemetry_scaled = scaler.transform(new_telemetry_raw)
 
 # Convert to tensor and predict
 new_tensor = torch.tensor(new_telemetry_scaled, dtype=torch.float32)
-predicted_strategy = model(new_tensor)
+model.eval()
+
+with torch.no_grad():
+    predicted_next_energy = model(new_tensor)
 
 print(f"New raw input: {new_telemetry_raw[0]}")
-print(f"Predicted Strategy Output: {predicted_strategy.item():.4f}")
+print(
+    f"Predicted next-interval energy: "
+    f"{predicted_next_energy.item():.4f} J"
+)
